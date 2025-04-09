@@ -1,4 +1,14 @@
-FROM node:18-slim
+# Use Alpine Linux as the base image
+FROM alpine:latest
+
+# Set the working directory
 WORKDIR /app
-COPY index.html /app/
-CMD ["npx", "serve", "-s", "/app", "-l", "3000"]
+
+# Copy application files (if any)
+COPY . /app
+
+# Install essential packages (optional)
+RUN apk add --no-cache bash curl
+
+# Define the default command
+CMD ["sh"]

@@ -1,0 +1,288 @@
+name: Docker Image CI with Artifact Support
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: 'Image tag'
+        required: true
+        type: string
+      registry:
+        description: 'Docker registry'
+        required: true
+        type: string
+      repository:
+        description: 'Docker repository'
+        required: true
+        type: string
+      dockerfile:
+        description: 'Path to Dockerfile'
+        required: false
+        type: string
+        default: './Dockerfile'
+      context:
+        description: 'Docker build context (base folder for the artifact)'
+        required: false
+        type: string
+        default: '.'
+      rabbitmq_url:
+        description: 'RabbitMQ URL'
+        required: true
+        type: string
+      rabbitmq_queue:
+        description: 'RabbitMQ queue'
+        required: true
+        type: string
+      rabbitmq_exchange:
+        description: 'RabbitMQ exchange'
+        required: true
+        type: string
+      rabbitmq_binding_key:
+        description: 'RabbitMQ binding key'
+        required: true
+        type: string
+      org:
+        description: 'Organization name'
+        required: true
+        type: string
+      application_tags:
+        description: 'Application tags (comma-separated)'
+        type: string
+        required: false
+        default: ""
+      artifacts:
+        description: 'Non-image artifacts (comma-separated list in proper format for ArtifactSplit)'
+        required: false
+        type: string
+        default: ""
+      source_code_path:
+        description: 'Path to source code'
+        required: false
+        type: string
+        default: ""
+      artifactory_url:
+        description: 'Artifactory URLs for non-image artifacts (comma-separated, order matching artifacts)'
+        required: false
+        type: string
+        default: ""
+      skip_docker_build:
+        description: 'Skip Docker build and push (for artifacts-only builds)'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      docker_username:
+        description: 'Docker Hub username'
+        required: true
+      docker_password:
+        description: 'Docker Hub password'
+        required: true
+      rabbitmq_user:
+        description: 'RabbitMQ user'
+        required: true
+      rabbitmq_pass:
+        description: 'RabbitMQ password'
+        required: true
+      JFROG_URL:
+        description: 'JFrog Artifactory URL'
+        required: false
+      JFROG_USERNAME:
+        description: 'JFrog Artifactory username'
+        required: false
+      JFROG_PASSWORD:
+        description: 'JFrog Artifactory password or token'
+        required: false
+
+jobs:
+  build_and_push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # Fetch enough history to allow diffing with the previous commit
+
+      # Docker build steps (skipped for artifact-only builds)
+      - name: Set up Docker Buildx
+        if: ${{ !inputs.skip_docker_build }}
+        uses: docker/setup-buildx-action@v1
+
+      - name: Login to Docker Hub
+        if: ${{ !inputs.skip_docker_build }}
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.docker_username }}
+          password: ${{ secrets.docker_password }}
+
+      - name: Build and push Docker image
+        if: ${{ !inputs.skip_docker_build }}
+        uses: docker/build-push-action@v2
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ inputs.registry }}/${{ inputs.repository }}:${{ inputs.image_tag }}
+
+      - name: Pull and get image digest
+        if: ${{ !inputs.skip_docker_build }}
+        run: |
+          docker pull ${{ inputs.registry }}/${{ inputs.repository }}:${{ inputs.image_tag }}
+          echo "IMAGE_SHA=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ inputs.registry }}/${{ inputs.repository }}:${{ inputs.image_tag }} | cut -d':' -f2)" >> $GITHUB_ENV
+
+      # For artifact-only builds, set a placeholder SHA
+      - name: Set placeholder values for artifact-only builds
+        if: ${{ inputs.skip_docker_build }}
+        run: echo "IMAGE_SHA=placeholder" >> $GITHUB_ENV
+
+      - name: Get Repository Metadata
+        run: |
+          echo "Fetching repository metadata"
+          VISIBILITY=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }} | jq -r '.visibility')
+          PARENT_REPO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }} | jq -r '.parent.full_name // empty')
+          LICENSE_NAME=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }} | jq -r '.license.spdx_id // empty')
+          echo "VISIBILITY=$VISIBILITY" >> $GITHUB_ENV
+          echo "PARENT_REPO=$PARENT_REPO" >> $GITHUB_ENV
+          echo "LICENSE_NAME=$LICENSE_NAME" >> $GITHUB_ENV
+
+      - name: Get Diff Commits
+        run: |
+          # Instead of sending the full diff, just send the commit SHAs
+          if [ $(git rev-list --count HEAD) -gt 1 ]; then
+            PREVIOUS_COMMIT=$(git rev-parse HEAD~1)
+            echo "DIFF_COMMITS=${PREVIOUS_COMMIT}" >> $GITHUB_ENV
+          else
+            echo "DIFF_COMMITS=initial_commit" >> $GITHUB_ENV
+          fi
+
+      - name: Create RabbitMQ Exchange and Queue, and Bind them
+        run: |
+          # Create the exchange
+          curl -u ${{ secrets.rabbitmq_user }}:${{ secrets.rabbitmq_pass }} \
+               -H "Content-Type: application/json" \
+               -X PUT "${{ inputs.rabbitmq_url }}/api/exchanges/%2F/${{ inputs.rabbitmq_exchange }}" \
+               -d '{"type":"direct","durable":true}'
+
+          # Create the queue
+          curl -u ${{ secrets.rabbitmq_user }}:${{ secrets.rabbitmq_pass }} \
+               -H "Content-Type: application/json" \
+               -X PUT "${{ inputs.rabbitmq_url }}/api/queues/%2F/${{ inputs.rabbitmq_queue }}" \
+               -d '{"durable":true}'
+
+          # Bind the queue to the exchange with the binding key
+          curl -u ${{ secrets.rabbitmq_user }}:${{ secrets.rabbitmq_pass }} \
+               -H "Content-Type: application/json" \
+               -X POST "${{ inputs.rabbitmq_url }}/api/bindings/%2F/e/${{ inputs.rabbitmq_exchange }}/q/${{ inputs.rabbitmq_queue }}" \
+               -d '{"routing_key":"${{ inputs.rabbitmq_binding_key }}"}'
+
+      - name: Prepare and Send RabbitMQ Message
+        run: |
+          echo "Preparing message for RabbitMQ..."
+          
+          # Decode the diff commits from base64 and convert to JSON string
+          DIFF_COMMITS=$(echo "${{ env.DIFF_B64 }}" | base64 -d | jq -Rs .)
+          
+          JOB_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          BUILD_TIME=$(date +%s%3N)  # Current time in milliseconds
+          
+          # Ensure we have an image value even for artifact-only builds
+          IMAGE="${{ inputs.registry }}/${{ inputs.repository }}:${{ inputs.image_tag }}"
+          IMAGE_TAG="${{ inputs.image_tag }}"
+          IMG_SHA="${{ env.IMAGE_SHA }}"
+          
+          # Process artifacts input into JSON array if provided
+          ARTIFACTS_JSON="[]"
+          if [ ! -z "${{ inputs.artifacts }}" ]; then
+            # Convert comma-separated list to JSON array
+            ARTIFACTS_JSON=$(echo "${{ inputs.artifacts }}" | jq -R -s 'split(",") | map(select(. != ""))')
+          fi
+          
+          # Prepare artifactory URLs array if provided
+          ARTIFACTORY_URL_JSON="[]"
+          if [ ! -z "${{ inputs.artifactory_url }}" ]; then
+            ARTIFACTORY_URL_JSON=$(echo "${{ inputs.artifactory_url }}" | jq -R -s 'split(",") | map(select(. != ""))')
+          fi
+          
+          # Convert application tags to proper format
+          APP_TAGS_JSON="[]"
+          if [ ! -z "${{ inputs.application_tags }}" ]; then
+            APP_TAGS_JSON=$(echo "${{ inputs.application_tags }}" | jq -R -s 'split(",") | map(select(. != ""))')
+          fi
+          
+          # Keep source code path as a simple string
+          SOURCE_CODE_PATH="${{ inputs.source_code_path }}"
+          
+          # Output debug info
+          echo "=== DEBUG: Message Fields ==="
+          echo "Image: $IMAGE"
+          echo "Image TAG: $IMAGE_TAG"
+          echo "Image SHA: $IMG_SHA"
+          echo "Organisation: ${{ inputs.org }}"
+          echo "Source Code Path: $SOURCE_CODE_PATH"
+          
+          # Build the message - IMPORTANT: Match field names expected by GitHub Actions plugin
+          MESSAGE=$(jq -n \
+            --arg type "com.github.build.finished" \
+            --argjson data "$(jq -n \
+              --arg image "$IMAGE" \
+              --arg imageTag "$IMAGE_TAG" \
+              --arg imgsha "$IMG_SHA" \
+              --arg jobId "${{ github.job }}" \
+              --arg buildNumber "${{ github.run_number }}" \
+              --arg gitUrl "${{ github.event.repository.html_url }}" \
+              --arg gitCommit "${{ github.sha }}" \
+              --arg gitBranch "${{ github.ref_name }}" \
+              --arg jobUrl "$JOB_URL" \
+              --arg buildTime "$BUILD_TIME" \
+              --arg buildUser "${{ github.actor }}" \
+              --arg visibility "${{ env.VISIBILITY }}" \
+              --arg parentRepo "${{ env.PARENT_REPO }}" \
+              --arg licenseName "${{ env.LICENSE_NAME }}" \
+              --arg organization "${{ inputs.org }}" \
+              --arg workflowName "GitHub Actions Workflow" \
+              --argjson applicationTags "$APP_TAGS_JSON" \
+              --argjson artifacts "$ARTIFACTS_JSON" \
+              --argjson artifactoryUrl "$ARTIFACTORY_URL_JSON" \
+              --arg sourceCodePath "$SOURCE_CODE_PATH" \
+              '{
+                "image": $image, 
+                "imageTag": $imageTag, 
+                "imgsha": $imgsha, 
+                "jobId": $jobId,
+                "buildNumber": $buildNumber, 
+                "gitUrl": $gitUrl, 
+                "gitCommit": $gitCommit, 
+                "gitBranch": $gitBranch, 
+                "jobUrl": $jobUrl, 
+                "buildTime": $buildTime, 
+                "buildUser": $buildUser, 
+                "diffCommits": "",
+                "organization": $organization,
+                "workflowName": $workflowName,
+                "artifacts": $artifacts,
+                "applicationTags": $applicationTags,
+                "artifactoryUrl": $artifactoryUrl,
+                "sourceCodePath": $sourceCodePath
+              }'
+            )" \
+            '{type: $type, data: $data | tostring}'
+          )
+          
+          # Log a sample of the message to verify structure
+          echo "Message sample: $(echo $MESSAGE | head -c 200)..."
+          
+          PAYLOAD=$(jq -n --arg vhost "/" \
+                          --arg name "${{ inputs.rabbitmq_exchange }}" \
+                          --argjson properties '{}' \
+                          --arg routing_key "${{ inputs.rabbitmq_binding_key }}" \
+                          --arg delivery_mode "2" \
+                          --arg payload "$MESSAGE" \
+                          --arg payload_encoding "string" \
+                          '{vhost: $vhost, name: $name, properties: $properties, routing_key: $routing_key, delivery_mode: $delivery_mode, payload: $payload, payload_encoding: $payload_encoding}')
+          
+          echo "Sending message to RabbitMQ..."
+          
+          # Send the message to RabbitMQ
+          curl -s -u ${{ secrets.rabbitmq_user }}:${{ secrets.rabbitmq_pass }} \
+              -H "Content-Type: application/json" \
+              -X POST "${{ inputs.rabbitmq_url }}/api/exchanges/%2F/${{ inputs.rabbitmq_exchange }}/publish" \
+              --data-binary "$PAYLOAD" || { echo "Failed to send message"; exit 1; }

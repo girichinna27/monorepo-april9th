@@ -1,111 +1,39 @@
-name: Build Frontend and Backend Artifact
+name: Use Docker CI Workflow
+
 on:
   push:
     branches: [ "main" ]
-jobs:
-  build-jar:
-    runs-on: ubuntu-latest
-    outputs:
-      artifactory_url: ${{ steps.set_url.outputs.url }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up JDK 11
-        uses: actions/setup-java@v3
-        with:
-          java-version: '11'
-          distribution: 'temurin'
-          cache: maven
-      
-      - name: Build JAR
-        run: |
-          cd backend
-          mvn clean package
-      
-      - name: Upload JAR artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: jar-file
-          path: backend/target/core-utils-1.0.0.jar
-      
-      - name: Upload to Artifactory using curl
-        id: upload-jar
-        continue-on-error: true
-        run: |
-          # First check if Artifactory is accessible
-          PING_RESULT=$(curl -s -u ${{ secrets.JFROG_USERNAME }}:${{ secrets.JFROG_PASSWORD }} \
-            ${{ secrets.JFROG_URL }}/api/system/ping)
-          
-          echo "Artifactory ping result: $PING_RESULT"
-          
-          if [ "$PING_RESULT" == "OK" ]; then
-            # Upload JAR using curl
-            UPLOAD_RESULT=$(curl -s -X PUT \
-              -u ${{ secrets.JFROG_USERNAME }}:${{ secrets.JFROG_PASSWORD }} \
-              -H "Content-Type: application/java-archive" \
-              --data-binary "@backend/target/core-utils-1.0.0.jar" \
-              "${{ secrets.JFROG_URL }}/libs-release-local-libs-release/org/ahmad1194/core-utils/1.0.0/core-utils-1.0.0.jar")
-            
-            echo "Upload result: $UPLOAD_RESULT"
-            
-            # Check if upload was successful
-            if [[ "$UPLOAD_RESULT" == *"created"* ]]; then
-              echo "UPLOAD_STATUS=success" >> $GITHUB_ENV
-            fi
-          fi
-      
-      - name: Set Artifactory URL
-        id: set_url
-        run: |
-          if [ "${UPLOAD_STATUS:-}" == "success" ]; then
-            echo "url=${{ secrets.JFROG_URL }}/libs-release-local-libs-release/org/ahmad1194/core-utils/1.0.0/core-utils-1.0.0.jar" >> $GITHUB_OUTPUT
-          else
-            echo "url=placeholder-url-for-testing" >> $GITHUB_OUTPUT
-          fi
+  pull_request:
+    branches: [ "main" ]
 
+jobs:
   build:
-    needs: build-jar
     strategy:
       matrix:
-        include:
-          # Docker image only (frontend)
+        artifact:
           - name: frontend
             context: './frontend'
             dockerfile: './frontend/Dockerfile'
-            repository: 'ahmad1194/frontend'
+            repository: 'rajsomesetty/multiartifact-frontend'
             image_tag: "frontend-${{ github.run_id }}"
-            artifacts: ""
-            app_tags: "frontend,web,ui"
-            folder_path: "frontend"
-            skip_docker: false
-            
-          # JAR artifact only (no Docker)
-          - name: backend-lib
-            repository: 'ahmad1194/dummy'
-            image_tag: "dummy-${{ github.run_id }}" 
-            artifacts: "core-utils|1.0.0|core-utils-1.0.0.jar"
-            app_tags: "library,core,java"
-            folder_path: "backend"
-            skip_docker: true
-    
-    uses: Samra10/reusable-workflows/.github/workflows/docker-image.yml@main
+          - name: backend
+            context: './backend'
+            dockerfile: './backend/Dockerfile'
+            repository: 'rajsomesetty/multiartifact-backend'
+            image_tag: "backend-${{ github.run_id }}"
+    uses: girichinna27/reusable-workflows/.github/workflows/docker-image.yml@main
     with:
-      image_tag: ${{ matrix.image_tag }}
+      image_tag: ${{ matrix.artifact.image_tag }}
       registry: 'docker.io'
-      repository: ${{ matrix.repository }}
-      dockerfile: ${{ matrix.dockerfile || '' }}
-      context: ${{ matrix.context || '.' }}
-      artifacts: ${{ matrix.artifacts }}
-      source_code_path: ${{ matrix.folder_path }}
-      artifactory_url: ${{ needs.build-jar.outputs.artifactory_url }}
-      rabbitmq_url: "http://34.56.228.233:15672"
+      repository: ${{ matrix.artifact.repository }}
+      dockerfile: ${{ matrix.artifact.dockerfile }}
+      context: ${{ matrix.artifact.context }}
+      rabbitmq_url: "http://34.29.129.115:15672"
       rabbitmq_queue: "githubactions-ssd"
       rabbitmq_exchange: "githubactions.events"
       rabbitmq_binding_key: "githubactions-ssd"
-      org: "opsmx"
-      application_tags: ${{ matrix.app_tags }}
-      skip_docker_build: ${{ matrix.skip_docker }}
+      org: "ortseam"
+      application_tags: "v1.0"
     secrets:
       docker_username: ${{ secrets.DOCKER_USERNAME }}
       docker_password: ${{ secrets.DOCKER_PASSWORD }}
